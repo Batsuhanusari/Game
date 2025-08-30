@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mini Wolf3D Raycasting + Shoot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    /* Ekranı dolduralım; canvas dışı siyah arka plan */
+    html, body { margin:0; height:100%; background:#000; }
+    /* Basit HUD yazıları için konumlayıcı */
+    .hud {
+      position: fixed; /* Neden: Canvas üstüne bindirmek için, akıştan bağımsız konum */
+      left: 10px; top: 10px; /* Neden: Sol üst köşeye sabitlemek */
+      color: #0f0; font: 14px/1.2 monospace; /* Neden: Eski oyun konsolu hissi için */
+      user-select: none; /* Neden: Yazılar seçilemesin; oyun hissi bozulmasın */
+      pointer-events: none; /* Neden: HUD tıklamayı engellemesin */
+      text-shadow: 0 0 6px #0f0;
+    }
+    .crosshair {
+      position: fixed; /* Neden: Ekran merkezine sabitlenmiş nişangâh */
+      left: 50%; top: 50%; transform: translate(-50%, -50%);
+      width: 16px; height: 16px; /* Neden: Küçük, dikkat dağıtmayan nişangâh */
+      pointer-events: none; user-select: none;
+    }
+    .crosshair::before, .crosshair::after {
+      content: ""; position: absolute;
+      background: #0f0; /* Neden: Kontrastı yüksek nişangâh */
+    }
+    .crosshair::before {
+      left: 7px; top: 0; width: 2px; height: 16px; /* Neden: Dikey çizgi */
+    }
+    .crosshair::after {
+      left: 0; top: 7px; width: 16px; height: 2px; /* Neden: Yatay çizgi */
+    }
+    .flash {
+      position: fixed; inset: 0; background: radial-gradient(rgba(255,255,255,0.4), rgba(255,255,255,0) 60%);
+      opacity: 0; transition: opacity 80ms linear; /* Neden: Kısa bir flaş efekti */
+      pointer-events: none;
+    }
+    .flash.active { opacity: 1; } /* Neden: Ateş ederken kısa süreli parlamayı aç/kapat */
+    .hitmarker {
+      position: fixed; left:50%; top:50%; transform: translate(-50%, -50%);
+      color:#fff; font: 700 18px monospace; text-shadow: 0 0 6px #f00;
+      opacity:0; transition: opacity 120ms ease-out; pointer-events: none;
+    }
+    .hitmarker.active { opacity: 1; } /* Neden: Vurunca kısa süre görünmesi için */
+  </style>
+</head>
+<body>
+  <canvas id="game" width="960" height="480"></canvas>
+  <div class="hud" id="hud"></div>
+  <div class="crosshair"></div>
+  <div class="flash" id="flash"></div>
+  <div class="hitmarker" id="hit">+1</div>
+
+<script>
+// ====== TEMEL AYARLAR ======
+
+// 1) Canvas ve bağlamı alıyoruz — neden: tüm çizimler burada yapılacak
+const canvas = document.getElementById("game");  // Neden: çizim yüzeyi referansı
+const ctx = canvas.getContext("2d");             // Neden: 2D çizim API’si lazım
+
+// 2) HUD ve efekt elemanları — neden: skor, flaş, hit göstermek için overlay
+const hudEl = document.getElementById("hud");    // Neden: bilgi metinlerini güncellemek
+const flashEl = document.getElementById("flash");// Neden: ateş anında kısa flaş efekti
+const hitEl = document.getElementById("hit");    // Neden: düşman vuruldu görseli
+
+// 3) Oyun haritası — neden: raycasting de duvar çarpışmalarını çözmek için
+//    '#' duvar, '.' boşluk. Dış duvarları kapalı tutmak “dışarı kaçma” hatalarını önler.
+const map = [
+  "################",
+  "#..............#",
+  "#..##......##..#",
+  "#..............#",
+  "#....##..##....#",
+  "#..............#",
+  "#..##......##..#",
+  "#..............#",
+  "################"
+];
+const mapW = map[0].length;   // Neden: x ekseninde hücre sayısı
+const mapH = map.length;      // Neden: y ekseninde hücre sayısı
+
+// 4) Oyuncu konum/yön — neden: kamera ve hareketin temeli
+let posX = 3.5;               // Neden: hücre merkezinden başlatmak, duvar kenarı takılmasını azaltır
+let posY = 3.5;               // Neden: aynı gerekçe ile merkez
+let dir = 0;                  // Neden: 0 radyan = +x yönü (sağa bakış)
+const moveSpeed = 3.0;        // Neden: saniye başına hız; deltaTime ile çarpılacak
+const rotSpeed  = 2.4;        // Neden: saniye başına dönüş hızı; rahat kontrol için ayarlı
+
+// 5) Kamera görüş açısı — neden: ray’leri kademelendirmek
+const FOV = Math.PI / 3;      // Neden: ~60° klasik retro his
+const zBuffer = new Float32Array(canvas.width); // Neden: duvar derinliklerini saklayıp sprite örtüşmesini çözmek
+
+// 6) Giriş durumları — neden: tuşa basılı tutmayı algılamak
+const keys = new Set();       // Neden: aynı anda birden fazla tuşu takip etmek
+
+// 7) Düşmanlar — neden: hedeflerimiz (billboard sprite gibi çizilecek basit sütunlar)
+//    'alive' ile vurulup vurulmadığını takip ediyoruz.
+const enemies = [
+  { x: 8.5, y: 2.5, alive: true },
+  { x: 11.5, y: 5.5, alive: true },
+  { x: 4.5, y: 6.5, alive: true }
+];
+
+// 8) Skor ve atış kontrolü — neden: oyun geri bildirimi ve spam ateşi önleme
+let score = 0;                        // Neden: vurulan düşman sayısı
+let lastShotTime = 0;                 // Neden: cooldown takip
+const fireCooldownMs = 220;           // Neden: dakikalı makineli gibi olmasın; dengeli his
+
+// ====== YARDIMCI FONKSİYONLAR ======
+
+// clamp: sayı aralığını sınırlamak — neden: hesapların taşmasını engellemek
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+// normalizeAngle: açıyı [-PI, PI] aralığına getir — neden: fark hesaplarında stabilite
+function normalizeAngle(a) {
+  while (a > Math.PI) a -= 2*Math.PI;
+  while (a < -Math.PI) a += 2*Math.PI;
+  return a;
+}
+
+// isWall: hücre duvar mı? — neden: çarpışma ve ray durdurma için
+function isWall(mx, my) {
+  if (mx < 0 || my < 0 || mx >= mapW || my >= mapH) return true; // Neden: harita dışı = duvar varsay
+  return map[my][mx] === '#';
+}
+
+// canMoveTo: hedef pozisyon boş mu? — neden: yürürken duvara girmemek
+function canMoveTo(x, y) {
+  return !isWall(Math.floor(x), Math.floor(y));
+}
+
+// ====== RENDER: DUVARLAR (RAYCAST) ======
+
+// renderWorld: her frame’de duvarları tarayıp dikey şeritlerle çizer
+function renderWorld() {
+  // Gökyüzü ve zemin — neden: duvar dışındaki alanları doldurmak
+  ctx.fillStyle = "#202238";                        // Neden: koyu mavi gökyüzü
+  ctx.fillRect(0, 0, canvas.width, canvas.height/2);
+  ctx.fillStyle = "#121212";                        // Neden: zemin
+  ctx.fillRect(0, canvas.height/2, canvas.width, canvas.height/2);
+
+  // Her ekran sütunu için bir ray at
+  for (let x = 0; x < canvas.width; x++) {
+    // cameraX: -1..1 aralığı — neden: sol kenar -1, orta 0, sağ kenar +1
+    const cameraX = 2 * x / canvas.width - 1;                     // Neden: sütunu görüş konisine orantılamak
+    const rayDir = dir + cameraX * FOV;                           // Neden: bu sütunun baktığı mutlak açı
+    const stepSize = 0.02;                                        // Neden: küçük adımlar hassas çarpışma
+    let rayX = posX, rayY = posY;                                 // Neden: ışını oyuncu konumundan başlat
+    let dist = 0;                                                  // Neden: mesafe hesaplayıp yükseklik türeteceğiz
+    let hit = false;                                               // Neden: duvara çarpana kadar yürü
+
+    // Ray duvara çarpana kadar ilerle
+    while (!hit && dist < 30) {                                    // Neden: maksimum menzil limiti
+      rayX += Math.cos(rayDir) * stepSize;                         // Neden: açının x bileşeni kadar ilerle
+      rayY += Math.sin(rayDir) * stepSize;                         // Neden: açının y bileşeni kadar ilerle
+      dist += stepSize;                                            // Neden: duvar yüksekliği için mesafe gerekiyor
+      if (isWall(Math.floor(rayX), Math.floor(rayY))) hit = true;  // Neden: hücre duvar ise ışını durdur
+    }
+
+    // Çarpışma uzaklığını zBuffer’a yaz — neden: sonra sprite örtüşme çözümü
+    zBuffer[x] = dist;
+
+    // Duvarın ekrandaki yüksekliği — neden: retro perspektif (1/dist) oranı
+    const wallH = Math.min(canvas.height, (1 / dist) * 900);       // Neden: tavan değeri ile aşırı yakın patlamayı kes
+    // Basit gölgeleme — neden: uzaklaştıkça soluklaşsın
+    const shade = Math.max(0, 1 - dist/12);
+    const g = Math.floor(100 + 100*shade);
+    ctx.fillStyle = `rgb(${g/2},${g},${g/2})`;                     // Neden: tek renk tonlamayla duvar etkisi
+    ctx.fillRect(x, (canvas.height - wallH) / 2, 1, wallH);        // Neden: 1px genişlikte sütun çizimi
+  }
+}
+
+// ====== RENDER: DÜŞMAN “BILLBOARD” ======
+
+// drawEnemies: düşmanları duvarlardan sonra çizer, zBuffer ile örtüşme kontrol eder
+function drawEnemies() {
+  // Uzak olanı önce çizmek yerine: yakına çizerken duvarla kıyaslayacağız.
+  // Ama görsel tutarlılık için yine de uzak→yakın sırala; kıyası zBuffer belirler.
+  const sorted = enemies
+    .filter(e => e.alive)
+    .map(e => ({ e, dist: Math.hypot(e.x - posX, e.y - posY) }))
+    .sort((a, b) => b.dist - a.dist); // Neden: uzaktakini önce hesaplamak (klasik yöntem)
+
+  for (const { e, dist } of sorted) {
+    const dx = e.x - posX;                               // Neden: oyuncudan düşmana vektör
+    const dy = e.y - posY;
+    const angleTo = Math.atan2(dy, dx);                  // Neden: oyuncudan düşmana mutlak açı
+    let rel = normalizeAngle(angleTo - dir);             // Neden: oyuncu görüşüne göre göreli açı
+
+    // FOV dışında ise ekranda görünmez
+    if (Math.abs(rel) > FOV * 0.7) continue;             // Neden: küçük tolerans + sınırlama
+
+    // Ekran X konumu: rel=-FOV/2 -> 0, rel=0 -> orta, rel=+FOV/2 -> width
+    const screenX = (rel / FOV + 0.5) * canvas.width;    // Neden: açıdan piksele projeksiyon
+    const spriteH = Math.min(canvas.height, (1 / dist) * 1000); // Neden: yakına gelince büyüsün
+    const spriteW = spriteH * 0.6;                       // Neden: insan silüeti oranı gibi
+    const top = canvas.height/2 - spriteH/2;             // Neden: merkeze yerleştirme
+    const left = screenX - spriteW/2;
+
+    // Dikey şeritlerle sprite çiz; zBuffer ile duvar arkasında kalanı gizle
+    for (let sx = 0; sx < spriteW; sx++) {
+      const x = Math.floor(left + sx);
+      if (x < 0 || x >= canvas.width) continue;          // Neden: ekran dışında
+      // Duvar zBuffer kıyası: düşman duvardan yakınsa çizilebilir
+      if (dist < zBuffer[x]) {
+        // Basit gövde: üstten 20% kafa, ortadan 60% gövde, altta 20% bacak gibi ton
+        const columnShade = 220;                          // Neden: parlak bir ana renk
+        ctx.fillStyle = `rgb(${columnShade},${Math.max(0, 180 - dist*8)},${Math.max(0, 180 - dist*12)})`;
+        ctx.fillRect(x, top, 1, spriteH);
+        // Orta çizgi — neden: silüete küçük kontrast
+        if (sx === Math.floor(spriteW/2)) {
+          ctx.fillStyle = "#111";
+          ctx.fillRect(x, top, 1, spriteH);
+        }
+      }
+    }
+  }
+}
+
+// ====== HAREKET VE KONTROLLER ======
+
+// handleInput: deltaTime ile süreye bağlı hareket/dönüş uygula
+function handleInput(dt) {
+  const cos = Math.cos(dir), sin = Math.sin(dir);          // Neden: yön vektörünü tekrar tekrar hesaplamamak
+  const stepMove = moveSpeed * dt;                         // Neden: FPS bağımsız hız
+  const stepRot  = rotSpeed  * dt;                         // Neden: FPS bağımsız dönüş
+
+  // Dönüşler
+  if (keys.has("a") || keys.has("ArrowLeft"))  dir -= stepRot;  // Neden: sola bakış
+  if (keys.has("d") || keys.has("ArrowRight")) dir += stepRot;  // Neden: sağa bakış
+
+  // İleri/Geri
+  if (keys.has("w") || keys.has("ArrowUp")) {
+    const nx = posX + cos * stepMove;                      // Neden: ileri yön x
+    const ny = posY + sin * stepMove;                      // Neden: ileri yön y
+    if (canMoveTo(nx, posY)) posX = nx;                    // Neden: eksen başına çarpışma
+    if (canMoveTo(posX, ny)) posY = ny;
+  }
+  if (keys.has("s") || keys.has("ArrowDown")) {
+    const nx = posX - cos * stepMove;                      // Neden: geri yön x
+    const ny = posY - sin * stepMove;                      // Neden: geri yön y
+    if (canMoveTo(nx, posY)) posX = nx;
+    if (canMoveTo(posX, ny)) posY = ny;
+  }
+}
+
+// ====== ATEŞ MEKANİĞİ (RAY HİTSCAN) ======
+
+// fire: merkez ray’ı at; ilk duvar öncesi herhangi bir düşmana “yakın geçiş” varsa vur
+function fire() {
+  const now = performance.now();                           // Neden: cooldown ölçümü için kesin zaman
+  if (now - lastShotTime < fireCooldownMs) return;         // Neden: spam ateşi engelle
+  lastShotTime = now;                                      // Neden: yeni atış zamanı kaydı
+
+  // Muzzle flash görseli — kısa süre açık tut
+  flashEl.classList.add("active");                         // Neden: parlamayı başlat
+  setTimeout(() => flashEl.classList.remove("active"), 60);// Neden: 60ms sonra söndür
+
+  const rayDir = dir;                                      // Neden: merkez sütun ateşi = bakılan açı
+  const stepSize = 0.02;                                   // Neden: yüksek isabet çözünürlüğü
+  let rayX = posX, rayY = posY;                            // Neden: ışın başlangıcı
+  let dist = 0;                                            // Neden: menzil/duvar kontrolü
+
+  // Yakından geçiş yarıçapı — neden: “tam nokta” çok zor; hafif tolerans gerçekçi his
+  const hitRadius = 0.28;                                  // Neden: düşman merkezine bu kadar yaklaşınca isabet say
+
+  // Işını ilerlet: duvara çarparsa dur, aksi halde düşmanla yakınlığı dene
+  while (dist < 25) {                                      // Neden: makul menzil sınırı
+    rayX += Math.cos(rayDir) * stepSize;                   // Neden: ray adımı x
+    rayY += Math.sin(rayDir) * stepSize;                   // Neden: ray adımı y
+    dist += stepSize;                                      // Neden: toplam mesafe
+
+    // Duvara çarptıysa: kurşun burada durur
+    if (isWall(Math.floor(rayX), Math.floor(rayY))) break; // Neden: mermi duvarı delmesin
+
+    // Her adımda canlı düşmanlara yakın geçiyor muyuz?
+    for (const e of enemies) {                             // Neden: tüm hedefleri kontrol
+      if (!e.alive) continue;                              // Neden: ölü hedefi atla
+      const d = Math.hypot(e.x - rayX, e.y - rayY);        // Neden: ray noktasına uzaklık
+      if (d < hitRadius) {                                 // Neden: yeterince yakınsa “vuruldu” say
+        e.alive = false;                                   // Neden: hedefi düşür
+        score++;                                           // Neden: skor arttır
+        // Hit marker kısa süre görünür
+        hitEl.classList.add("active");                     // Neden: görsel geri bildirim
+        setTimeout(() => hitEl.classList.remove("active"), 120);
+        return;                                            // Neden: ilk isabette mermi durur
+      }
+    }
+  }
+}
+
+// ====== OYUN DÖNGÜSÜ ======
+
+let lastTime = performance.now();                          // Neden: deltaTime hesaplamak
+function loop() {
+  const now = performance.now();                           // Neden: şimdiki zaman
+  const dt = (now - lastTime) / 1000;                      // Neden: ms → saniye
+  lastTime = now;                                          // Neden: bir sonraki frame için güncelle
+
+  handleInput(dt);                                         // Neden: girişe bağlı hareket/dönüş
+  renderWorld();                                           // Neden: duvarları çiz
+  drawEnemies();                                           // Neden: düşmanları duvarlara göre çiz
+
+  // HUD metni güncelle — neden: anlık bilgi (konum, skor)
+  hudEl.textContent =
+    `X:${posX.toFixed(2)}  Y:${posY.toFixed(2)}  ` +
+    `Dir:${(dir*180/Math.PI).toFixed(0)}°  ` +
+    `Skor:${score}`;
+
+  requestAnimationFrame(loop);                             // Neden: akıcı animasyon
+}
+loop();                                                    // Neden: döngüyü başlatmak
+
+// ====== GİRİŞ OLAYLARI ======
+
+// Klavye basılı — neden: çoklu tuş yönetimi
+addEventListener("keydown", (e) => {
+  // Boşluk ateş — neden: FPS kültürü :)
+  if (e.code === "Space") { e.preventDefault(); fire(); }  // Neden: sayfa kaydırmasını engelle
+  keys.add(e.key);                                         // Neden: basılı set’ine ekle
+});
+
+// Klavye bırakıldı — neden: hareketi durdurmak
+addEventListener("keyup", (e) => {
+  keys.delete(e.key);                                      // Neden: set’ten çıkarmak
+});
+
+// Fare tıklaması ateş — neden: tipik kontrol şeması
+addEventListener("mousedown", (e) => {
+  if (e.button === 0) fire();                              // Neden: sol tık ateş
+});
+
+// Pencere odak kaybı — neden: tuşlar takılı kalmasın
+addEventListener("blur", () => keys.clear());              // Neden: güvenli reset
+</script>
+</body>
+</html>
